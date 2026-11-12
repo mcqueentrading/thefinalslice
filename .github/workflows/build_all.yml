@@ -1,0 +1,312 @@
+name: Build all
+
+on:
+  create:
+
+  workflow_dispatch: # allows for manual dispatch
+    inputs:
+      build-deps-only:
+        description: 'Only build dependencies (bypasses caching)'
+        type: boolean
+        default: false
+      build_linux:
+        description: 'Build Linux AppImage artifacts'
+        type: boolean
+        default: true
+      build_flatpak:
+        description: 'Build Linux Flatpak artifacts'
+        type: boolean
+        default: false
+      build_windows:
+        description: 'Build Windows artifacts'
+        type: boolean
+        default: true
+      build_windows_installer:
+        description: 'Build Windows installer'
+        type: boolean
+        default: false
+      build_without_pch_windows:
+        description: 'Build without PCH (windows)'
+        type: boolean
+        default: false
+      build_macos:
+        description: 'Build macOS artifacts'
+        type: boolean
+        default: true
+      build_macos_x86_64:
+        description: 'Build macOS x86_64 and universal artifacts'
+        type: boolean
+        default: false
+      release_version:
+        description: 'Version number to build and publish, for example 1.0.9. Defaults to version_number.txt'
+        type: string
+        required: false
+        default: ''
+      publish_release:
+        description: 'Publish selected Windows, macOS, and Linux artifacts to a GitHub release'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  actions: read
+  checks: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_linux:
+    strategy:
+      fail-fast: false
+    if: ${{ !cancelled() && (github.event_name != 'create' || (github.event.ref_type == 'branch' && startsWith(github.event.ref, 'release/'))) && (inputs.build_linux || github.event_name != 'workflow_dispatch' || vars.BUILD_LINUX == 'true') }}
+    uses: ./.github/workflows/build_check_cache.yml
+    with:
+      os: ${{ vars.SELF_HOSTED && 'orca-lnx-server' || 'ubuntu-24.04' }}
+      build-deps-only: ${{ inputs.build-deps-only || false }}
+      release-version: ${{ inputs.release_version || '' }}
+    secrets: inherit
+  build_windows:
+    if: ${{ !cancelled() && (inputs.build_windows || github.event_name != 'workflow_dispatch') && (github.event_name != 'create' || (github.event.ref_type == 'branch' && startsWith(github.event.ref, 'release/'))) }}
+    uses: ./.github/workflows/build_check_cache.yml
+    with:
+      os: ${{ vars.SELF_HOSTED && 'orca-win-server' || 'windows-latest' }}
+      build-deps-only: ${{ inputs.build-deps-only || false }}
+      force-build: false
+      release-version: ${{ inputs.release_version || '' }}
+      build_windows_installer: ${{ inputs.build_windows_installer || false }}
+      build_without_pch_windows: ${{ inputs.build_without_pch_windows || false }}
+    secrets: inherit
+  build_macos_arch:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(((inputs.build_macos_x86_64 || false) || vars.BUILD_MACOS_X86_64 == 'true') && '["arm64","x86_64"]' || '["arm64"]') }}
+    if: ${{ !cancelled() && (inputs.build_macos || github.event_name != 'workflow_dispatch') && (github.event_name != 'create' || (github.event.ref_type == 'branch' && startsWith(github.event.ref, 'release/'))) }}
+    uses: ./.github/workflows/build_check_cache.yml
+    with:
+      os: ${{ vars.SELF_HOSTED && 'orca-macos-arm64' || 'macos-14' }}
+      arch: ${{ matrix.arch }}
+      build-deps-only: ${{ inputs.build-deps-only || false }}
+      force-build: false
+      release-version: ${{ inputs.release_version || '' }}
+    secrets: inherit
+  build_macos_universal:
+    name: Build macOS Universal
+    needs: build_macos_arch
+    if: ${{ !cancelled() && (inputs.build_macos || github.event_name != 'workflow_dispatch') && (github.event_name != 'create' || (github.event.ref_type == 'branch' && startsWith(github.event.ref, 'release/'))) && ((inputs.build_macos_x86_64 || false) || vars.BUILD_MACOS_X86_64 == 'true') && needs.build_macos_arch.result == 'success' && !inputs.build-deps-only }}
+    uses: ./.github/workflows/build_orca.yml
+    with:
+      os: ${{ vars.SELF_HOSTED && 'orca-macos-arm64' || 'macos-14' }}
+      arch: universal
+      macos-combine-only: true
+      release-version: ${{ inputs.release_version || '' }}
+    secrets: inherit
+  publish_release:
+    name: Publish Release
+    runs-on: ubuntu-24.04
+    needs:
+      - build_linux
+      - build_windows
+      - build_macos_arch
+      - build_macos_universal
+      - flatpak
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && (inputs.publish_release || false) && !inputs.build-deps-only && (inputs.build_windows || inputs.build_macos || inputs.build_linux || inputs.build_flatpak || vars.BUILD_LINUX == 'true' || vars.BUILD_FLATPAK == 'true') }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          lfs: 'false'
+      - name: Get release version
+        id: release_version
+        run: |
+          version="${{ inputs.release_version }}"
+          version=$(printf '%s' "$version" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^[vV]//')
+          if [ -z "$version" ]; then
+            version=$(sed -n '1{s/^[[:space:]]*//;s/[[:space:]]*$//;s/^[vV]//;p;q;}' version_number.txt)
+          fi
+          if ! printf '%s\n' "$version" | grep -Eq '^[0-9]+(\.[0-9]+){2}([-.+][A-Za-z0-9][A-Za-z0-9.-]*)?$'; then
+            echo "Invalid release version: $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release-artifacts
+      - name: Publish GitHub release
+        run: |
+          tag="${{ steps.release_version.outputs.tag }}"
+          version="${{ steps.release_version.outputs.version }}"
+          mapfile -t assets < <(find release-artifacts -type f \( \
+            -name "OrcaSlicer-ImageMap_Mac_*_V$version.dmg" -o \
+            -name "OrcaSlicer-ImageMap_Windows_V${version}_portable.zip" -o \
+            -name "OrcaSlicer-ImageMap_Windows_Installer_V${version}.exe" -o \
+            -name "OrcaSlicer-ImageMap_Linux_AppImage*_V${version}.AppImage" -o \
+            -name "OrcaSlicer-ImageMap-Linux-flatpak_V${version}_*.flatpak" \
+          \) ! -name '*profile_validator*' | sort)
+
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No release assets found for version $version" >&2
+            find release-artifacts -type f | sort >&2
+            exit 1
+          fi
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --title "OrcaSlicer-ImageMap $version"
+            gh release upload "$tag" "${assets[@]}" --clobber
+          else
+            gh release create "$tag" "${assets[@]}" \
+              --target "$GITHUB_SHA" \
+              --title "OrcaSlicer-ImageMap $version" \
+              --notes "Automated build from $GITHUB_SHA"
+          fi
+  unit_tests:
+    name: Unit Tests
+    runs-on: ${{ vars.SELF_HOSTED && 'orca-lnx-server' || 'ubuntu-24.04' }}
+    needs: build_linux
+    if: ${{ !cancelled() && (github.event_name != 'create' || (github.event.ref_type == 'branch' && startsWith(github.event.ref, 'release/'))) && (inputs.build_linux || github.event_name != 'workflow_dispatch' || vars.BUILD_LINUX == 'true') && needs.build_linux.result == 'success' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            .github
+            scripts
+            tests
+      - name: Apt-Install Dependencies
+        if: ${{ !vars.SELF_HOSTED }}
+        uses: ./.github/actions/apt-install-deps
+      - name: Restore Test Artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ github.sha }}-tests
+      - uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: "~4.3.0"  # use most recent 4.3.x version
+          useLocalCache: true         # <--= Use the local cache (default is 'false').
+          useCloudCache: true
+      - name: Unpackage and Run Unit Tests
+        timeout-minutes: 20
+        run: |
+          tar -xvf build_tests.tar
+          scripts/run_unit_tests.sh
+      - name: Upload Test Logs
+        uses: actions/upload-artifact@v7
+        if: ${{ failure() }}
+        with:
+          name: unit-test-logs
+          path: build/tests/**/*.log
+      - name: Publish Test Results
+        if: always()
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        with:
+          files: "ctest_results.xml"
+      - name: Delete Test Artifact
+        if: success()
+        uses: geekyeggo/delete-artifact@v6
+        with:
+          name: ${{ github.sha }}-tests
+  flatpak:
+    name: "Flatpak"
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-49
+      options: --privileged
+      volumes:
+        - /usr/local/lib/android:/usr/local/lib/android
+        - /usr/share/dotnet:/usr/share/dotnet
+        - /opt/ghc:/opt/ghc1
+        - /usr/local/share/boost:/usr/local/share/boost1
+        - /opt/hostedtoolcache:/opt/hostedtoolcache1
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    if: ${{ !cancelled() && (github.event_name != 'create' || (github.event.ref_type == 'branch' && startsWith(github.event.ref, 'release/'))) && !vars.SELF_HOSTED && !inputs.build-deps-only && ((inputs.build_flatpak || false) || vars.BUILD_FLATPAK == 'true') }}
+
+    runs-on: ${{ matrix.variant.runner }}
+    env:
+      date:
+      ver:
+      ver_pure:
+    steps:
+    - name: "Remove unneeded stuff to free disk space"
+      run:
+        rm -rf /usr/local/lib/android/* /usr/share/dotnet/* /opt/ghc1/* "/usr/local/share/boost1/*" /opt/hostedtoolcache1/*
+    - uses: actions/checkout@v6
+    - name: Get the version and date
+      run: |
+        ver_pure="${{ inputs.release_version }}"
+        ver_pure=$(printf '%s' "$ver_pure" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^[vV]//')
+        if [ -n "$ver_pure" ]; then
+          printf '%s\n' "$ver_pure" > version_number.txt
+        else
+          ver_pure=$(sed -n '1{s/^[[:space:]]*//;s/[[:space:]]*$//;s/^[vV]//;p;q;}' version_number.txt)
+        fi
+        if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          ver="PR-${{ github.event.number }}"
+          git_commit_hash="${{ github.event.pull_request.head.sha }}"
+        else
+          ver=V$ver_pure
+          git_commit_hash="${{ github.sha }}"
+        fi
+        echo "ver=$ver" >> $GITHUB_ENV
+        echo "ver_pure=$ver_pure" >> $GITHUB_ENV
+        echo "date=$(date +'%Y%m%d')" >> $GITHUB_ENV
+        echo "git_commit_hash=$git_commit_hash" >> $GITHUB_ENV
+      shell: bash
+    # Manage flatpak-builder cache externally so PRs restore but never upload
+    - name: Restore flatpak-builder cache
+      if: github.event_name == 'pull_request'
+      uses: actions/cache/restore@v5
+      with:
+        path: .flatpak-builder
+        key: flatpak-builder-${{ matrix.variant.arch }}-${{ github.event.pull_request.base.sha }}
+        restore-keys: flatpak-builder-${{ matrix.variant.arch }}-
+    - name: Save/restore flatpak-builder cache
+      if: github.event_name != 'pull_request'
+      uses: actions/cache@v5
+      with:
+        path: .flatpak-builder
+        key: flatpak-builder-${{ matrix.variant.arch }}-${{ github.sha }}
+        restore-keys: flatpak-builder-${{ matrix.variant.arch }}-
+    - name: Disable debug info for faster CI builds
+      run: |
+        sed -i '/^build-options:/a\  no-debuginfo: true\n  strip: true' \
+          scripts/flatpak/com.orcaslicer.OrcaSlicer.ImageMap.yml
+      shell: bash
+    - name: Inject git commit hash into Flatpak manifest
+      run: |
+        sed -i "/name: OrcaSlicer/{n;s|buildsystem: simple|buildsystem: simple\n    build-options:\n      env:\n        git_commit_hash: \"$git_commit_hash\"|}" \
+          scripts/flatpak/com.orcaslicer.OrcaSlicer.ImageMap.yml
+      shell: bash
+    - uses: flatpak/flatpak-github-actions/flatpak-builder@master
+      with:
+        bundle: OrcaSlicer-ImageMap-Linux-flatpak_${{ env.ver }}_${{ matrix.variant.arch }}.flatpak
+        manifest-path: scripts/flatpak/com.orcaslicer.OrcaSlicer.ImageMap.yml
+        cache: false
+        arch: ${{ matrix.variant.arch }}
+        upload-artifact: false
+    - name: Upload artifacts Flatpak
+      uses: actions/upload-artifact@v7
+      with:
+        name: OrcaSlicer-ImageMap-Linux-flatpak_${{ env.ver }}_${{ matrix.variant.arch }}.flatpak
+        path: '/__w/OrcaSlicer/OrcaSlicer/OrcaSlicer-ImageMap-Linux-flatpak_${{ env.ver }}_${{ matrix.variant.arch }}.flatpak'
+    - name: Deploy Flatpak to nightly release
+      if: github.repository == 'OrcaSlicer/OrcaSlicer' && github.ref == 'refs/heads/main'
+      uses: WebFreak001/deploy-nightly@v3.2.0
+      with:
+        upload_url: https://uploads.github.com/repos/OrcaSlicer/OrcaSlicer/releases/137995723/assets{?name,label}
+        release_id: 137995723
+        asset_path: /__w/OrcaSlicer/OrcaSlicer/OrcaSlicer-ImageMap-Linux-flatpak_${{ env.ver }}_${{ matrix.variant.arch }}.flatpak
+        asset_name: OrcaSlicer-ImageMap-Linux-flatpak_nightly_${{ matrix.variant.arch }}.flatpak
+        asset_content_type: application/octet-stream
+        max_releases: 1 # optional, if there are more releases than this matching the asset_name, the oldest ones are going to be deleted
