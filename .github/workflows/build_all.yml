@@ -117,7 +117,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           lfs: 'false'
       - name: Get release version
@@ -172,7 +172,7 @@ jobs:
     if: ${{ !cancelled() && (github.event_name != 'create' || (github.event.ref_type == 'branch' && startsWith(github.event.ref, 'release/'))) && (inputs.build_linux || github.event_name != 'workflow_dispatch' || vars.BUILD_LINUX == 'true') && needs.build_linux.result == 'success' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           sparse-checkout: |
             .github
@@ -241,7 +241,7 @@ jobs:
     - name: "Remove unneeded stuff to free disk space"
       run:
         rm -rf /usr/local/lib/android/* /usr/share/dotnet/* /opt/ghc1/* "/usr/local/share/boost1/*" /opt/hostedtoolcache1/*
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Get the version and date
       run: |
         ver_pure="${{ inputs.release_version }}"
